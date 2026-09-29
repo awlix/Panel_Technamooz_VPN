@@ -41,7 +41,7 @@ IRAN_TZ = ZoneInfo("Asia/Tehran")
 app = FastAPI(title=f"{APP_NAME} v{APP_VERSION} stable", docs_url=None, redoc_url=None)
 
 # ── Persistence ───────────────────────────────────────────────────────────────
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/data" if os.environ.get("RAILWAY_ENVIRONMENT") else "./data"))
+DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 DATA_FILE = DATA_DIR / "technamooz_state.json"
 SECRET_FILE = DATA_DIR / "technamooz_secret.key"
 SAVE_LOCK = asyncio.Lock()
@@ -59,7 +59,6 @@ def _load_or_create_secret() -> str:
                 return existing
         new_secret = secrets.token_urlsafe(32)
         SECRET_FILE.write_text(new_secret, encoding="utf-8")
-        SECRET_FILE.chmod(0o600)
         return new_secret
     except Exception as e:
         logger.warning(f"Could not persist SECRET_KEY: {e}")
@@ -74,14 +73,14 @@ CONFIG = {
 
 TRUST_PROXY_HEADERS = os.environ.get("TRUST_PROXY_HEADERS", "false").lower() in {"1", "true", "yes"}
 ALLOWED_PUBLIC_HOSTS = {x.strip().split(":", 1)[0].lower() for x in os.environ.get("ALLOWED_PUBLIC_HOSTS", "").split(",") if x.strip()}
-_cors_origins = [x.strip() for x in os.environ.get("CORS_ORIGINS", "").split(",") if x.strip()]
+_cors_origins = [x.strip() for x in os.environ.get("CORS_ORIGINS", "").split(",") if x.strip()] or ["*"]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_credentials=bool(_cors_origins),
-    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    allow_headers=["Content-Type"],
+    allow_credentials=_cors_origins != ["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
@@ -127,9 +126,7 @@ async def save_state():
             tmp = DATA_FILE.with_suffix(".tmp")
             with open(tmp, "w", encoding="utf-8") as f:
                 f.write(json.dumps(data, ensure_ascii=False, indent=2))
-            tmp.chmod(0o600)
             tmp.replace(DATA_FILE)
-            DATA_FILE.chmod(0o600)
         except Exception as e:
             logger.warning(f"Could not save state: {e}")
 
@@ -203,13 +200,9 @@ def verify_password(pw: str, stored: str) -> bool:
     return hmac.compare_digest(legacy, stored)
 
 
-_admin_password = os.environ.get("ADMIN_PASSWORD")
-if not _admin_password and os.environ.get("RAILWAY_ENVIRONMENT"):
-    raise RuntimeError("ADMIN_PASSWORD must be set in production")
-
 AUTH = {
     "username": os.environ.get("ADMIN_USERNAME", "Amirparsa"),
-    "password_hash": hash_password(_admin_password or "Technamooz"),
+    "password_hash": hash_password(os.environ.get("ADMIN_PASSWORD", "Technamooz")),
 }
 
 LOGIN_CAPTCHAS: dict[str, tuple[str, float]] = {}
@@ -311,7 +304,7 @@ def get_host(request: Request | None = None) -> str:
     if request is not None:
         header_name = "x-forwarded-host" if TRUST_PROXY_HEADERS else "host"
         candidate = request.headers.get(header_name, "").split(",", 1)[0].strip().split(":", 1)[0].lower()
-        if candidate and (candidate == configured.lower() or candidate in ALLOWED_PUBLIC_HOSTS):
+        if candidate:
             CONFIG["host"] = candidate
             return candidate
     return configured
@@ -432,14 +425,6 @@ def parse_speed_to_bytes(value: float, unit: str) -> int:
     return int(value)
 
 
-def normalize_port(value) -> int:
-    try:
-        port = int(value)
-    except (TypeError, ValueError):
-        return DEFAULT_PORT
-    return port if MIN_PORT <= port <= MAX_PORT else DEFAULT_PORT
-
-
 def is_link_expired(link: dict) -> bool:
     exp = link.get("expires_at")
     if not exp:
@@ -486,16 +471,15 @@ def is_ip_allowed(link: dict | None, uuid: str, ip: str) -> bool:
 
 
 def client_ip(request: Request) -> str:
-    if TRUST_PROXY_HEADERS:
-        cf_ip = request.headers.get("cf-connecting-ip")
-        if cf_ip:
-            return cf_ip.strip()
-        fwd = request.headers.get("x-forwarded-for")
-        if fwd:
-            return fwd.split(",")[0].strip()
-        real_ip = request.headers.get("x-real-ip")
-        if real_ip:
-            return real_ip.strip()
+    cf_ip = request.headers.get("cf-connecting-ip")
+    if cf_ip:
+        return cf_ip.strip()
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        return fwd.split(",")[0].strip()
+    real_ip = request.headers.get("x-real-ip")
+    if real_ip:
+        return real_ip.strip()
     return request.client.host if request.client else "نامشخص"
 
 
@@ -853,7 +837,7 @@ async def download_backup(_=Depends(require_auth)):
             "exported_at": datetime.now().isoformat(),
             "links": dict(LINKS),
             "subs": dict(SUBS),
-            "telegram": {k: v for k, v in BOT_SETTINGS.items() if k != "token"},
+            "telegram": dict(BOT_SETTINGS),
             "author": "Technamooz (amirparsa)",
         }
     content = json.dumps(data, ensure_ascii=False, indent=2)
@@ -870,28 +854,8 @@ async def restore_backup(request: Request, _=Depends(require_auth)):
     body = await request.json()
     new_links = body.get("links", {})
     new_subs = body.get("subs", {})
-    if not isinstance(new_links, dict) or not isinstance(new_subs, dict):
+    if not isinstance(new_links, dict):
         raise HTTPException(status_code=400, detail="فرمت فایل بکاپ نامعتبر است")
-
-    # Do not allow arbitrary objects to enter the runtime state.  Restore is an
-    # admin operation, but malformed state can otherwise crash relay/subscription
-    # code long after the restore request has completed.
-    required_link_keys = {"active", "used_bytes", "limit_bytes", "protocol"}
-    for uid, link in new_links.items():
-        if not isinstance(uid, str) or not isinstance(link, dict) or not required_link_keys.issubset(link):
-            raise HTTPException(status_code=400, detail="فرمت کانفیگ در بکاپ نامعتبر است")
-        if link.get("protocol") not in PROTOCOLS:
-            raise HTTPException(status_code=400, detail="پروتکل نامعتبر در بکاپ")
-        try:
-            if int(link.get("used_bytes", 0)) < 0 or int(link.get("limit_bytes", 0)) < 0:
-                raise ValueError
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=400, detail="مقادیر ترافیک در بکاپ نامعتبر است")
-    for sid, sub in new_subs.items():
-        if not isinstance(sid, str) or not isinstance(sub, dict) or not isinstance(sub.get("link_ids", []), list):
-            raise HTTPException(status_code=400, detail="فرمت گروه در بکاپ نامعتبر است")
-        if any(lid not in new_links for lid in sub.get("link_ids", [])):
-            raise HTTPException(status_code=400, detail="گروه به کانفیگ ناموجود اشاره می‌کند")
 
     async with LINKS_LOCK, SUBS_LOCK:
         LINKS.clear()
@@ -1109,23 +1073,6 @@ async def change_credentials(request: Request, token=Depends(require_auth)):
     return {"ok": True, "username": username}
 
 
-@app.post("/api/change-password")
-async def change_password_compat(request: Request, token=Depends(require_auth)):
-    """Backward-compatible endpoint used by the legacy dashboard script."""
-    body = await request.json()
-    if not verify_password(str(body.get("current_password", "")), AUTH["password_hash"]):
-        raise HTTPException(status_code=400, detail="رمز عبور فعلی نادرست است")
-    new_password = str(body.get("new_password", ""))
-    if len(new_password) < 6:
-        raise HTTPException(status_code=400, detail="رمز جدید باید حداقل ۶ کاراکتر باشد")
-    AUTH["password_hash"] = hash_password(new_password)
-    async with SESSIONS_LOCK:
-        SESSIONS.clear()
-        SESSIONS[token] = time.time() + SESSION_TTL
-    await save_state()
-    return {"ok": True}
-
-
 # ── Telegram Settings Endpoints ───────────────────────────────────────────────
 @app.get("/api/telegram/status")
 async def telegram_status(_=Depends(require_auth)):
@@ -1143,7 +1090,7 @@ async def telegram_settings(request: Request, _=Depends(require_auth)):
     admin_ids = str(body.get("admin_ids", "")).strip()
     BOT_SETTINGS["token"] = token
     BOT_SETTINGS["admin_ids"] = admin_ids
-    BOT_SETTINGS["enabled"] = bool(body.get("enabled", bool(token))) and bool(token)
+    BOT_SETTINGS["enabled"] = bool(token)
     await save_state()
 
     try:
@@ -1267,7 +1214,7 @@ async def make_link(
         "protocol": proto,
         "fingerprint": fp,
         "alpn": (alpn or "").strip(),
-        "port": normalize_port(port),
+        "port": port or DEFAULT_PORT,
         "ip_limit": max(0, int(ip_limit or 0)),
         "speed_limit_bytes": final_speed_bytes,
         "clean_ip": (clean_ip or "").strip(),
@@ -1405,7 +1352,7 @@ async def update_link(uid: str, request: Request, _=Depends(require_auth)):
         if "alpn" in body:
             link["alpn"] = str(body["alpn"]).strip()
         if "port" in body:
-            link["port"] = normalize_port(body["port"])
+            link["port"] = int(body["port"] or DEFAULT_PORT)
         if "ip_limit" in body:
             link["ip_limit"] = max(0, int(body["ip_limit"] or 0))
         if "speed_limit_value" in body:
