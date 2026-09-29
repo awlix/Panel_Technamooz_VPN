@@ -25,8 +25,9 @@ from main import (
     logger,
     save_state,
     stats,
+    TRUST_PROXY_HEADERS,
 )
-from relay_vless import check_and_use, parse_vless_header
+from relay_vless import check_and_use, open_public_connection, parse_vless_header
 from speed_limit import record_ip_active, throttle
 
 router = APIRouter()
@@ -168,20 +169,21 @@ class _AdaptiveFlow:
 
 
 def _req_client_ip(request: Request) -> str:
-    fwd = request.headers.get("x-forwarded-for")
-    if fwd:
-        return fwd.split(",")[0].strip()
-    real_ip = request.headers.get("x-real-ip")
-    if real_ip:
-        return real_ip.strip()
+    if TRUST_PROXY_HEADERS:
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            return fwd.split(",")[0].strip()
+        real_ip = request.headers.get("x-real-ip")
+        if real_ip:
+            return real_ip.strip()
     return request.client.host if request.client else "نامشخص"
 
 
 async def _open_tcp_from_header(first_chunk: bytes):
-    command, address, port, payload = await parse_vless_header(first_chunk)
-    reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(address, port), timeout=TCP_CONNECT_TIMEOUT
-    )
+    command, address, port, payload = await parse_vless_header(first_chunk, uuid)
+    if command != 1:
+        raise ValueError("only TCP relay commands are supported")
+    reader, writer = await open_public_connection(address, port, timeout=TCP_CONNECT_TIMEOUT)
     _tune_socket(writer)
     if payload:
         writer.write(payload)
